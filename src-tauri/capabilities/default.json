@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Fenêtre principale — aucune API Tauri exposée à la page distante.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
