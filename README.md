@@ -11,7 +11,22 @@ production (`https://jarvis-saas-seven.vercel.app`) : l'app est donc toujours
 - **Windows** (10/11, x64) : [Cadence-Setup.exe](https://github.com/memecoinsfrance-tech/cadence-app/releases/latest/download/Cadence-Setup.exe)
 
 L'app n'est pas signée par un certificat payant : macOS et Windows demandent
-une autorisation au premier lancement (voir le guide sur le site).
+une autorisation au premier lancement — guide sur
+[le site](https://cadence-site-gamma.vercel.app#telecharger).
+
+### macOS sans aucun avertissement
+
+L'avertissement Gatekeeper vient de l'attribut `com.apple.quarantine` que le
+navigateur pose sur les fichiers téléchargés. `curl` ne le pose pas : cette
+commande installe et lance Cadence sans la moindre question.
+
+```bash
+curl -fL https://github.com/memecoinsfrance-tech/cadence-app/releases/latest/download/Cadence.dmg -o /tmp/Cadence.dmg && VOL=$(hdiutil attach -nobrowse /tmp/Cadence.dmg | grep -o '/Volumes/.*$' | tail -1) && rm -rf /Applications/Cadence.app && ditto "$VOL/Cadence.app" /Applications/Cadence.app && hdiutil detach "$VOL" -quiet && rm /tmp/Cadence.dmg && open -a Cadence
+```
+
+Sur une app déjà installée : `xattr -cr /Applications/Cadence.app`.
+Supprimer l'avertissement *à la source* exigerait la notarisation Apple
+(programme développeur, 99 €/an) — il n'existe aucun contournement gratuit.
 
 ## Développement
 
