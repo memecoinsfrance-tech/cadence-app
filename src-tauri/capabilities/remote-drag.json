@@ -1,0 +1,13 @@
+{
+  "identifier": "remote-drag",
+  "description": "Parité dev/prod pour le glissement de fenêtre. En `tauri dev`, la feature custom-protocol est absente : l'app est servie depuis tauri://localhost et la page Vercel est alors classée Remote, si bien que la capability locale ne la matche plus et TOUTE l'IPC est refusée — alors qu'elle passe en release. Ce bloc rétablit la parité. Moindre privilège assumé : on n'accorde ici QUE le glissement et le zoom au double-clic, jamais core:default.",
+  "windows": ["main"],
+  "local": false,
+  "remote": {
+    "urls": ["https://jarvis-saas-seven.vercel.app/*"]
+  },
+  "permissions": [
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize"
+  ]
+}

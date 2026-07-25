@@ -1,6 +1,6 @@
 [package]
 name = "cadence-desktop"
-version = "1.0.1"
+version = "1.1.0"
 description = "Cadence — centre de contrôle personnel pour la classe préparatoire"
 edition = "2021"
 
