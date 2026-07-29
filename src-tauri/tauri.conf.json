@@ -17,7 +17,7 @@
       "endpoints": [
         "https://github.com/memecoinsfrance-tech/cadence-app/releases/latest/download/latest.json"
       ],
-      "pubkey": "REMPLACER_PAR_LA_CLE_PUBLIQUE — voir README §Mise à jour automatique",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU1RTZCRkI3RUExODVGRTIKUldUaVh4anF0Ny9tNVN5M0ZDMHNFcHkzUG9xVFZGRmRlM1VVRnljelNXVkxoenp1SHlrS2x4cXUK",
       "windows": {
         "installMode": "passive"
       }
