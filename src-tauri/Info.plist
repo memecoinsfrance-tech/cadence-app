@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Clés d'usage fusionnées par le bundler Tauri dans Cadence.app/Contents/Info.plist.
+
+  Pourquoi : la dictée du coach (Web Speech API dans la WKWebView) demande au
+  système l'accès au micro ET à la reconnaissance vocale. Sans ces deux chaînes,
+  macOS refuse la demande SANS afficher de fenêtre d'autorisation : dans l'app,
+  le bouton micro s'allumait puis retombait aussitôt, sans rien capter — alors
+  que la même page marche dans Safari (qui, lui, déclare ses clés).
+
+  Les textes sont montrés tels quels dans la fenêtre d'autorisation de macOS.
+-->
+<plist version="1.0">
+  <dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Cadence utilise le micro pour dicter tes messages au coach et répondre à l'oral pendant une khôlle.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Cadence transcrit ta voix pour que tu puisses parler au coach au lieu d'écrire.</string>
+  </dict>
+</plist>
