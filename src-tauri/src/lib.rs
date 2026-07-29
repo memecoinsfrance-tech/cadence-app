@@ -1,5 +1,7 @@
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
+#[cfg(desktop)]
+use tauri_plugin_updater::UpdaterExt;
 
 /// La coquille charge l'app web de production — même pattern que l'app iOS
 /// Capacitor (`server.url` dans capacitor.config.json de jarvis-saas).
@@ -107,6 +109,110 @@ fn init_script() -> String {
     }
 }
 
+/// Mise à jour automatique.
+///
+/// Principe de sûreté n°1 — l'updater ne doit JAMAIS empêcher l'app de démarrer.
+/// Toute cette fonction vit dans une tâche `async_runtime::spawn` détachée,
+/// lancée APRÈS que la fenêtre est à l'écran, et son `Result` est jeté par
+/// l'appelant. Aucun `?`, aucun `unwrap`, aucun `expect` ne remonte d'ici vers
+/// le `setup()` : un réseau coupé, un portail captif, un manifeste cassé ou une
+/// signature invalide se soldent par un log sur stderr et rien d'autre.
+///
+/// L'isolation par `spawn` ne tient que parce que `Cargo.toml` n'a AUCUNE
+/// section `[profile]` custom : le profil release garde `panic = "unwind"`, donc
+/// un panic ici ne tue que la tâche. Ne jamais ajouter `panic = "abort"` sans
+/// déplacer cette logique — ça détruirait silencieusement la garantie.
+///
+/// Politique : une seule vérification, 20 s après le lancement (le démarrage est
+/// déjà chargé — DNS + TLS Vercel, service worker, session Supabase, pulls) ;
+/// inutile de la disputer. Un étudiant ouvre/ferme l'app tous les jours, donc
+/// « au lancement » couvre l'essentiel du parc sans jamais interrompre en
+/// pleine session de révision. Vérifier plus souvent n'aiderait personne : entre
+/// deux checks le frein n'est pas la détection mais l'application.
+#[cfg(desktop)]
+async fn verifier_mise_a_jour(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
+    // `check()` reconstruit l'`Update` avec `timeout: None` EN DUR (updater.rs) :
+    // le timeout du builder ne couvre donc QUE la requête de manifeste. Sans un
+    // délai explicite sur le téléchargement, un portail captif (wifi de lycée
+    // qui répond 200 sans jamais finir) laisserait la connexion pendue.
+    let updater = app
+        .updater_builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    // `check()` peut renvoyer `Err(TargetsNotFound)` même quand l'utilisateur
+    // est DÉJÀ à jour, si `latest.json` n'a pas la clé de sa plateforme
+    // (`get_urls` est appelé avant la comparaison de version). C'est traité
+    // comme n'importe quelle erreur : on log, on abandonne, l'app tourne.
+    let Some(mut mise_a_jour) = updater.check().await? else {
+        return Ok(()); // déjà à jour, ou 204 No Content
+    };
+    // Timeout du téléchargement, à reposer à la main (cf. ci-dessus).
+    mise_a_jour.timeout = Some(std::time::Duration::from_secs(300));
+
+    // macOS : si le dossier qui contient Cadence.app n'est pas inscriptible,
+    // `install()` déclenche un dialogue AppleScript « administrateur » via
+    // run_on_main_thread. Surgir sans contexte 20 s après le lancement serait
+    // hostile — on préfère abandonner la mise à jour en silence (l'utilisateur
+    // réinstallera à la main). Le cas courant (compte admin, /Applications
+    // inscriptible par le groupe admin) passe la garde sans prompt.
+    #[cfg(target_os = "macos")]
+    if !bundle_inscriptible() {
+        eprintln!("updater: bundle non inscriptible — mise à jour ignorée (réinstallation manuelle)");
+        return Ok(());
+    }
+
+    // Télécharge ET installe. macOS : décompresse le .app.tar.gz vers un dossier
+    // temporaire puis échange le bundle en place — le processus vivant tourne
+    // encore l'ancien code, d'où le `restart()` juste après. Windows :
+    // `install()` lance l'installeur NSIS puis fait `std::process::exit(0)` ; le
+    // flag `/R` du mode « passive » relance l'app. Le `restart()` ci-dessous est
+    // donc du code MORT sur Windows (jamais atteint), mais inoffensif.
+    mise_a_jour
+        .download_and_install(
+            |_recu, _total| {},
+            || eprintln!("updater: téléchargement terminé, installation"),
+        )
+        .await?;
+
+    // L'état utilisateur ne vit PAS dans le bundle : store `zustand/persist` en
+    // localStorage (écrit de façon synchrone), miroir Supabase, documents en
+    // IndexedDB. Tout est indexé par l'`identifier` (app.cadence.desktop), jamais
+    // par la version — le redémarrage réhydrate à l'identique. `restart()` ne
+    // retourne jamais (`-> !`).
+    app.restart();
+}
+
+/// Le dossier qui contient `Cadence.app` est-il inscriptible par cet
+/// utilisateur ? On tente réellement d'y créer puis supprimer un fichier —
+/// seul test fiable des permissions POSIX effectives (les bits de `metadata`
+/// ne reflètent pas l'appartenance au groupe `admin`).
+///
+/// `current_exe()` pointe `…/Cadence.app/Contents/MacOS/cadence-desktop` ; on
+/// remonte de quatre crans pour obtenir le parent de `Cadence.app`.
+#[cfg(target_os = "macos")]
+fn bundle_inscriptible() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(parent_du_bundle) = exe
+        .parent() // MacOS
+        .and_then(|p| p.parent()) // Contents
+        .and_then(|p| p.parent()) // Cadence.app
+        .and_then(|p| p.parent()) // /Applications (ou autre)
+    else {
+        return false;
+    };
+    let sonde = parent_du_bundle.join(".cadence-write-test");
+    match std::fs::write(&sonde, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&sonde);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -186,6 +292,38 @@ pub fn run() {
             // sans ça, `unused_variables` casserait un CI en `-D warnings`.
             #[cfg(not(target_os = "macos"))]
             let _ = &fenetre;
+
+            // Mise à jour automatique — enregistrée APRÈS la fenêtre, et de façon
+            // à ne JAMAIS pouvoir empêcher le démarrage :
+            // - `plugin(...)` valide la config `plugins.updater` (dont la
+            //   `pubkey`) ; on n'utilise donc PAS `?` — une clé mal collée
+            //   désactiverait l'updater au lieu de faire paniquer l'app au boot.
+            // - la vérification tourne dans une tâche détachée dont le résultat
+            //   est ignoré (cf. `verifier_mise_a_jour`).
+            #[cfg(desktop)]
+            match app
+                .handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())
+            {
+                Ok(()) => {
+                    let h = app.handle().clone();
+                    // Thread OS dédié : 20 s de grâce au démarrage, puis on
+                    // exécute la vérification sur le runtime de Tauri. Un thread
+                    // plutôt qu'un `spawn` async évite de dépendre directement de
+                    // `tokio::time`, et garde le délai hors du runtime.
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(20));
+                        tauri::async_runtime::block_on(async move {
+                            if let Err(e) = verifier_mise_a_jour(h).await {
+                                eprintln!("updater: {e}");
+                            }
+                        });
+                    });
+                }
+                Err(e) => eprintln!(
+                    "updater: plugin non enregistré ({e}) — mises à jour désactivées, l'app démarre normalement"
+                ),
+            }
 
             Ok(())
         })

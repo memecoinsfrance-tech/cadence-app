@@ -8,7 +8,41 @@ permissions:
   contents: write
 
 jobs:
+  # Garde-fou lancé AVANT les builds : ils sont longs et coûteux, autant
+  # échouer en 20 s sur ubuntu si la release ne pourra de toute façon pas être
+  # signée ou si les numéros de version divergent.
+  garde:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version alignée sur le tag (3 fichiers) + secrets de signature présents
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          PW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME#v}"
+          CONF=$(jq -r .version src-tauri/tauri.conf.json)
+          PKG=$(jq -r .version package.json)
+          CARGO=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
+          if [ "$CONF" != "$V" ] || [ "$PKG" != "$V" ] || [ "$CARGO" != "$V" ]; then
+            echo "::error::versions divergentes — tag=$V tauri.conf.json=$CONF package.json=$PKG Cargo.toml=$CARGO"
+            exit 1
+          fi
+          # Sans clé privée, le build produit des artefacts non signés puis
+          # échoue ; sans mot de passe, il attend un prompt et brûle 10 min avant
+          # de mourir. On tranche tout de suite, avec un message actionnable.
+          if [ -z "$KEY" ]; then
+            echo "::error::secret TAURI_SIGNING_PRIVATE_KEY absent — voir README §Mise à jour automatique"
+            exit 1
+          fi
+          if [ -z "$PW" ]; then
+            echo "::error::secret TAURI_SIGNING_PRIVATE_KEY_PASSWORD absent (mettre une chaîne vide si la clé n'a pas de mot de passe)"
+            exit 1
+          fi
+
   build-macos:
+    needs: garde
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -26,16 +60,40 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm tauri build --target universal-apple-darwin --bundles dmg
-      - name: Nom d'asset stable
-        run: cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg Cadence.dmg
+      # `app` EN PLUS de `dmg` : l'artefact d'update macOS (Cadence.app.tar.gz)
+      # est fabriqué à partir du bundle `.app`, jamais du `.dmg` — que l'updater
+      # ne sait pas décompresser. Sans `app`, `createUpdaterArtifacts` échoue
+      # (« no updater-enabled targets were built »). Les secrets ne sont exposés
+      # QUE sur cette étape de build, jamais au niveau du workflow ni du job.
+      - name: Build macOS (universel) + artefacts d'update signés
+        run: pnpm tauri build --target universal-apple-darwin --bundles app,dmg
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - name: Noms d'assets stables
+        run: |
+          set -euo pipefail
+          B=src-tauri/target/universal-apple-darwin/release/bundle
+          cp "$B"/dmg/*.dmg              Cadence.dmg
+          cp "$B"/macos/*.app.tar.gz     Cadence.app.tar.gz
+          cp "$B"/macos/*.app.tar.gz.sig Cadence.app.tar.gz.sig
+          # `if-no-files-found: error` s'évalue sur l'ENSEMBLE du path multiligne
+          # de upload-artifact : il ne détecte pas un fichier manquant parmi
+          # trois. On teste donc chaque fichier explicitement.
+          for f in Cadence.dmg Cadence.app.tar.gz Cadence.app.tar.gz.sig; do
+            test -s "$f" || { echo "::error::$f manquant ou vide"; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: Cadence.dmg
+          path: |
+            Cadence.dmg
+            Cadence.app.tar.gz
+            Cadence.app.tar.gz.sig
           if-no-files-found: error
 
   build-windows:
+    needs: garde
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,13 +109,31 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm tauri build --bundles nsis
-      - name: Nom d'asset stable
-        run: Copy-Item src-tauri/target/release/bundle/nsis/*.exe Cadence-Setup.exe
+      # `nsis` est déjà une cible updater : le `.exe` publié EST la charge utile
+      # de mise à jour (Tauri v2 a abandonné le `.zip` de v1), seul le `.sig`
+      # s'ajoute. Aucun changement de `--bundles`.
+      - name: Build Windows (NSIS) + signature
+        run: pnpm tauri build --bundles nsis
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - name: Noms d'assets stables
+        run: |
+          $ErrorActionPreference = "Stop"
+          $B = "src-tauri/target/release/bundle/nsis"
+          foreach ($p in @("$B/*-setup.exe", "$B/*-setup.exe.sig")) {
+            if (@(Get-Item $p -ErrorAction SilentlyContinue).Count -ne 1) {
+              throw "attendu exactement 1 fichier pour $p"
+            }
+          }
+          Copy-Item "$B/*-setup.exe"     Cadence-Setup.exe
+          Copy-Item "$B/*-setup.exe.sig" Cadence-Setup.exe.sig
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: Cadence-Setup.exe
+          path: |
+            Cadence-Setup.exe
+            Cadence-Setup.exe.sig
           if-no-files-found: error
 
   release:
@@ -67,15 +143,112 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+
+      - name: Les 5 assets sont présents et non vides
+        run: |
+          set -euo pipefail
+          for f in Cadence.dmg Cadence-Setup.exe \
+                   Cadence.app.tar.gz Cadence.app.tar.gz.sig Cadence-Setup.exe.sig; do
+            test -s "$f" || { echo "::error::$f manquant"; exit 1; }
+          done
+
+      # Manifeste lu par tauri-plugin-updater. Deux points non négociables :
+      #
+      # 1. Les URL de charge utile sont ÉPINGLÉES SUR LE TAG
+      #    (releases/download/$TAG/…), jamais releases/latest/download/… : une
+      #    release publiée entre la lecture du manifeste et le téléchargement
+      #    servirait d'autres octets, et la vérification de signature échouerait.
+      #    Seul le manifeste lui-même est servi depuis l'URL « latest » stable
+      #    (l'endpoint compilé dans tauri.conf.json).
+      #
+      # 2. darwin-aarch64 ET darwin-x86_64 (+ leurs variantes -app, cherchées EN
+      #    PREMIER car bundle_type() retombe sur App) pointent sur le même
+      #    Cadence.app.tar.gz universel : tauri-plugin-updater v2 ne connaît PAS
+      #    darwin-universal. Une clé manquante = check() échoue sur toute une
+      #    moitié du parc, même à version identique (get_urls avant la
+      #    comparaison de version).
+      - name: Manifeste updater (latest.json)
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          BASE="https://github.com/$REPO/releases/download/$TAG"
+          MAC_SIG="$(cat Cadence.app.tar.gz.sig)"
+          WIN_SIG="$(cat Cadence-Setup.exe.sig)"
+          MAC_URL="$BASE/Cadence.app.tar.gz"
+          WIN_URL="$BASE/Cadence-Setup.exe"
+          jq -n \
+            --arg version  "$VERSION" \
+            --arg notes    "Cadence $VERSION — https://github.com/$REPO/releases/tag/$TAG" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg mac_url  "$MAC_URL" --arg mac_sig "$MAC_SIG" \
+            --arg win_url  "$WIN_URL" --arg win_sig "$WIN_SIG" \
+            '{
+               version:  $version,
+               notes:    $notes,
+               pub_date: $pub_date,
+               platforms: {
+                 "darwin-aarch64":     { signature: $mac_sig, url: $mac_url },
+                 "darwin-x86_64":      { signature: $mac_sig, url: $mac_url },
+                 "darwin-aarch64-app": { signature: $mac_sig, url: $mac_url },
+                 "darwin-x86_64-app":  { signature: $mac_sig, url: $mac_url },
+                 "windows-x86_64":     { signature: $win_sig, url: $win_url }
+               }
+             }' > latest.json
+          cat latest.json
+
+      # `draft: true` puis publication explicite : la release ne devient
+      # « latest » qu'une fois TOUS les assets téléversés, ce qui ferme la
+      # fenêtre où un client verrait un latest.json valide dont la charge utile
+      # n'est pas encore là (404). `fail_on_unmatched_files` vaut false par
+      # défaut — sans ça, un asset manquant serait publié sans bruit.
       - uses: softprops/action-gh-release@v2
         with:
+          draft: true
+          fail_on_unmatched_files: true
           files: |
             Cadence.dmg
             Cadence-Setup.exe
+            Cadence.app.tar.gz
+            Cadence.app.tar.gz.sig
+            Cadence-Setup.exe.sig
+            latest.json
           generate_release_notes: true
           body: |
-            **Cadence pour macOS** (`Cadence.dmg`, universel — Apple Silicon & Intel, macOS 12+)
-            **Cadence pour Windows** (`Cadence-Setup.exe`, Windows 10/11, x64)
+            **À télécharger : `Cadence.dmg`** (macOS, universel — Apple Silicon &
+            Intel, macOS 12+) ou **`Cadence-Setup.exe`** (Windows 10/11, x64).
+
+            Les autres fichiers (`*.app.tar.gz`, `*.sig`, `latest.json`) servent à
+            la mise à jour automatique — inutile de les télécharger à la main.
+
+            À partir de la 1.2.0, Cadence se met à jour toute seule : ces fichiers
+            ne servent qu'à la première installation.
 
             App non signée : macOS et Windows demandent une autorisation au
             premier lancement — guide d'installation sur le site Cadence.
+
+      # Publie, puis VÉRIFIE le manifeste réellement servi et l'accessibilité de
+      # chaque charge utile. C'est le seul garde-fou contre le pire mode de
+      # panne — un latest.json qui référence un fichier absent — car il est
+      # autrement totalement silencieux (l'app ne dit rien, elle ne se met juste
+      # jamais à jour). Ne détecte PAS une mauvaise pubkey : seule une vraie
+      # installation 1.2.0 → 1.2.1 sur une machine le peut.
+      - name: Publier, puis vérifier le manifeste servi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$REPO" --draft=false --latest
+          sleep 5
+          M=$(curl -fsSL "https://github.com/$REPO/releases/latest/download/latest.json")
+          echo "$M" | jq -e '.platforms["darwin-aarch64"].url
+                         and .platforms["darwin-x86_64"].url
+                         and .platforms["windows-x86_64"].url' > /dev/null
+          for u in $(echo "$M" | jq -r '.platforms[].url' | sort -u); do
+            curl -fsSIL -o /dev/null "$u" || { echo "::error::charge utile injoignable: $u"; exit 1; }
+          done
+          echo "Manifeste et charges utiles vérifiés."
